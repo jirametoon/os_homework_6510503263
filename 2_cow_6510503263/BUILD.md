@@ -1,4 +1,3 @@
-gcc -O2 -Wall -Wextra -std=c11 -o cow cow.c
 # RUN (Linux only; Python)
 
 This program demonstrates Copy-on-Write (CoW) after `fork()` by observing each process's Resident Set Size (VmRSS) from `/proc/self/status`.

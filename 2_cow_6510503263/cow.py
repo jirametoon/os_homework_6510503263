@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Copy-on-Write (CoW) demonstration in Python
-Student: จิรเมธ วัฒนไพบูลย์ (6510503263)
-Platform: Linux only (uses /proc and os.fork)
-Safety: Limits allocation sizes and minimizes memory pressure
-
-This program:
-- Allocates a large bytearray (default sizes: 50, 75, 100 MB)
-- Touches one byte per page to commit memory
-- fork() into parent/child and observes VmRSS from /proc/self/status
-- Child modifies one byte per page to trigger CoW; observe RSS change
-- Repeats for different sizes
-
-Do NOT run on Windows. Run on Linux only.
-"""
 from __future__ import annotations
 import argparse
 import os
@@ -37,6 +22,51 @@ def get_rss_kb() -> int:
     except Exception:
         return 0
     return 0
+
+def read_smaps_rollup_kb(pid: int) -> dict:
+    """
+    อ่านค่า key สำคัญจาก /proc/<pid>/smaps_rollup (หน่วย kB)
+    ใช้ได้บน Linux/WSL2 สำหรับโปรเซสของเราเอง
+    """
+    path = f"/proc/{pid}/smaps_rollup"
+    fields = {
+        "Rss": 0,
+        "Pss": 0,
+        "Shared_Clean": 0,
+        "Shared_Dirty": 0,
+        "Private_Clean": 0,
+        "Private_Dirty": 0,
+        "Referenced": 0,
+        "Anonymous": 0,
+        "AnonHugePages": 0,
+    }
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                if ":" in line:
+                    key, rest = line.split(":", 1)
+                    key = key.strip()
+                    if key in fields:
+                        # รูปแบบ "  12345 kB" → ดึงเฉพาะตัวเลข
+                        num = "".join(ch for ch in rest if ch.isdigit())
+                        fields[key] = int(num) if num else 0
+    except Exception:
+        pass
+    return fields
+
+def print_smaps(label: str, pid: int, size_mb: int) -> None:
+    """
+    พิมพ์ค่า smaps_rollup ย่อ เพื่อดู Shared_* และ Private_* ชัด ๆ
+    """
+    m = read_smaps_rollup_kb(pid)
+    def f(k): return m.get(k, 0)
+    print(
+        f"[{label}][pid={pid}][size={size_mb} MB] smaps_rollup: "
+        f"Rss={f('Rss')} kB, "
+        f"Shared=({f('Shared_Clean')}/{f('Shared_Dirty')}) kB, "
+        f"Private=({f('Private_Clean')}/{f('Private_Dirty')}) kB, "
+        f"Pss={f('Pss')} kB"
+    )
 
 
 def touch_memory(buf: bytearray, page: int) -> None:
@@ -78,7 +108,7 @@ def parse_sizes_arg(arg: str) -> List[int]:
     return out
 
 
-def run_trial(size_mb: int) -> int:
+def run_trial(size_mb: int, smaps: bool = False) -> int:
     page = os.sysconf('SC_PAGESIZE')
     max_mb = 256  # safety cap
     if size_mb < 10 or size_mb > max_mb:
@@ -94,9 +124,12 @@ def run_trial(size_mb: int) -> int:
         print("MemoryError: allocation failed")
         return -1
 
-    # Commit pages and measure
+    # 1) Parent: หลัง commit memory แต่ก่อน fork
     touch_memory(buf, page)
     print_status('parent', os.getpid(), size_mb, 'after-initialize-before-fork')
+    if smaps:
+        # โชว์ภาพรวม Shared/Private ของ parent ก่อน fork (ยังไม่มี child)
+        print_smaps('parent', os.getpid(), size_mb)
 
     # Pipes for sync: parent->child (p2c), child->parent (c2p)
     p2c_r, p2c_w = os.pipe()
@@ -104,53 +137,69 @@ def run_trial(size_mb: int) -> int:
 
     pid = os.fork()
     if pid == 0:
-        # Child
+        # ===== CHILD =====
         try:
             os.close(p2c_w)
             os.close(c2p_r)
+
+            # 2) Child: ทันทีหลัง fork (ยังแชร์เพจกับ parent)
             print_status('child', os.getpid(), size_mb, 'just-after-fork')
-            # Notify parent ready
+            if smaps:
+                # ตรงนี้คาดหวัง Shared_Clean สูง, Private_* ยังต่ำ
+                print_smaps('child', os.getpid(), size_mb)
+
+            # แจ้ง parent ว่า ready แล้ว
             os.write(c2p_w, b'R')
-            # Wait for go
+            # รอสัญญาณให้เริ่มเขียน
             os.read(p2c_r, 1)
-            # Modify to trigger CoW
+
+            # 3) Child: เขียน 1 ไบต์/เพจ → กระตุ้น CoW
             modify_memory_xor(buf, page)
+
+            # 4) Child: หลังแก้ไขเสร็จ → Private_* ควรเพิ่ม
             print_status('child', os.getpid(), size_mb, 'after-child-modify')
-            # Done
+            if smaps:
+                # ตรงนี้คาดหวัง Private_Dirty (หรือรวม Private_*) เพิ่มขึ้น
+                print_smaps('child', os.getpid(), size_mb)
+
+            # แจ้ง parent ว่าเสร็จแล้ว
             os.write(c2p_w, b'D')
         finally:
-            try:
-                os.close(p2c_r)
-            except OSError:
-                pass
-            try:
-                os.close(c2p_w)
-            except OSError:
-                pass
+            try: os.close(p2c_r)
+            except OSError: pass
+            try: os.close(c2p_w)
+            except OSError: pass
             os._exit(0)
+
     else:
-        # Parent
+        # ===== PARENT =====
         os.close(p2c_r)
         os.close(c2p_w)
+
+        # 2) Parent: ทันทีหลัง fork (ยังแชร์เพจกับ child)
         print_status('parent', os.getpid(), size_mb, 'just-after-fork')
-        # Wait for child ready
+        if smaps:
+            # ค่าจะคล้ายกับ child just-after-fork (แชร์เพจ)
+            print_smaps('parent', os.getpid(), size_mb)
+
+        # รอ child ready
         os.read(c2p_r, 1)
-        # Tell child to start modify
+        # ส่งสัญญาณให้ child เริ่มเขียน
         os.write(p2c_w, b'G')
-        # Wait for child done
+        # รอ child เสร็จ
         os.read(c2p_r, 1)
-        # Measure after child modified
+
+        # 4) Parent: หลัง child เขียนเสร็จ
         print_status('parent', os.getpid(), size_mb, 'after-child-modify')
-        # Cleanup
-        try:
-            os.close(p2c_w)
-        except OSError:
-            pass
-        try:
-            os.close(c2p_r)
-        except OSError:
-            pass
-        # Wait child
+        if smaps:
+            # Parent ไม่ได้เขียนเอง → Private_* ของ parent ไม่ควรเด้งขึ้นเยอะ
+            print_smaps('parent', os.getpid(), size_mb)
+
+        # cleanup
+        try: os.close(p2c_w)
+        except OSError: pass
+        try: os.close(c2p_r)
+        except OSError: pass
         os.waitpid(pid, 0)
     return 0
 
@@ -158,6 +207,7 @@ def run_trial(size_mb: int) -> int:
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description='Copy-on-Write (CoW) demo (Linux only)')
     parser.add_argument('--sizes', type=str, default='50,75,100', help='Comma-separated MB sizes, default: 50,75,100')
+    parser.add_argument('--smaps', action='store_true', help='พิมพ์ค่า /proc/<pid>/smaps_rollup ในแต่ละเฟสเพื่อโชว์ Shared/Private ชัดขึ้น')
     args = parser.parse_args(argv)
 
     try:
@@ -170,7 +220,7 @@ def main(argv: List[str]) -> int:
     print("NOTE: Run on Linux only. This program reads /proc to observe VmRSS.")
 
     for sz in sizes:
-        if run_trial(sz) != 0:
+        if run_trial(sz, smaps=args.smaps) != 0:
             print(f"Trial with {sz} MB failed or skipped.")
 
     print("\nAll trials completed.")
