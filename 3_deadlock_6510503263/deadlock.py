@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Deadlock Avoidance, Detection, and Resolution demo (Linux-safe, simulation only)
-Student: จิรเมธ วัฒนไพบูลย์ (6510503263)
-
-- Simulated resources only (no real OS resources are locked)
-- Threads represent processes; safe for DO NO HARM
-- Modes:
-  * avoidance: use Banker's Algorithm, no deadlock occurs
-  * detection: naive allocation with waiting; detect deadlock via wait-for graph and resolve by aborting victims
-
-Run examples (Linux, do not run on Windows):
-  python3 deadlock.py --mode avoidance
-  python3 deadlock.py --mode detection
-  python3 deadlock.py --mode detection --seed 42 --n 5 --resources 3,3,2
-"""
 from __future__ import annotations
 import argparse
 import random
